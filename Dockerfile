@@ -1,6 +1,9 @@
 FROM python:3.11-slim
 
-# Install FFmpeg, Node.js (JS runtime for yt-dlp), and certificates
+# Copy official Deno binary (recommended JS runtime for yt-dlp YouTube EJS)
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
+# Install FFmpeg, Node.js, and certificates
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg nodejs ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -13,7 +16,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY bot.py .
 
-# Create writable data dir (for non-root cloud runners like Hugging Face Spaces)
+# Create writable data dir
 RUN chmod -R 777 /app
 
 ENV PORT=7860

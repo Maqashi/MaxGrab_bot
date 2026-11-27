@@ -118,6 +118,8 @@ def humanize_error(exc: Exception) -> str:
         )
     if "private video" in low or "login required" in low or "members-only" in low:
         return "Это видео приватное или доступно только после входа в аккаунт."
+    if "requested format is not available" in low:
+        return "Не удалось получить доступный формат видео. Попробуй выбрать другое качество или MP3."
     if "video unavailable" in low or "not available" in low:
         return "Видео недоступно, удалено или ограничено по региону."
     if "unsupported url" in low:
@@ -430,6 +432,8 @@ def _base_ydl_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "js_runtimes": {"deno": {"path": None}, "node": {"path": None}},
+        "remote_components": ["ejs:github"],
     }
     if COOKIES_PATH and Path(COOKIES_PATH).is_file():
         opts["cookiefile"] = COOKIES_PATH
