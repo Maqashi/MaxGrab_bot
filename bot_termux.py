@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import gc
 import html
 import logging
@@ -66,7 +67,7 @@ GROUP_MEDIA_DOMAINS = (
 )
 
 URL_REGEX = re.compile(r"https?://\S+")
-executor = ThreadPoolExecutor(max_workers=2)
+executor = ThreadPoolExecutor(max_workers=4)
 url_store: Dict[str, dict] = {}
 
 
@@ -282,10 +283,21 @@ def estimate_sizes(info: dict) -> tuple[Dict[str, float], Dict[str, str]]:
     return raw, {k: format_size(v) for k, v in raw.items()}
 
 
-def store_url_entry(url: str, raw_sizes: dict | None = None, sizes: dict | None = None) -> str:
+def store_url_entry(
+    url: str,
+    raw_sizes: dict | None = None,
+    sizes: dict | None = None,
+    raw_info: dict | None = None,
+) -> str:
     token = uuid.uuid4().hex[:10]
-    url_store[token] = {"url": url, "raw_sizes": raw_sizes or {}, "sizes": sizes or {}}
-    if len(url_store) > 500:
+    url_store[token] = {
+        "url": url,
+        "raw_sizes": raw_sizes or {},
+        "sizes": sizes or {},
+        "raw_info": raw_info,
+        "ts": time.monotonic(),
+    }
+    if len(url_store) > 100:
         url_store.pop(next(iter(url_store)))
     return token
 
@@ -329,9 +341,12 @@ def build_switch_buttons(token: str, current_mode: str):
 def _base_ydl_opts() -> dict:
     opts: dict = {
         "quiet": True,
-        "no_warnings": False,
+        "no_warnings": True,
         "noplaylist": True,
-        "remote_components": ["ejs:github"],
+        "force_ipv4": True,
+        "socket_timeout": 15,
+        "retries": 3,
+        "fragment_retries": 3,
     }
     node_path = shutil.which("node")
     if node_path:
@@ -354,12 +369,24 @@ def extract_info_sync(url: str) -> dict:
         "extractor": info.get("extractor_key") or info.get("extractor") or "Web",
         "sizes": str_sizes,
         "raw_sizes": raw_sizes,
+        "raw_info": info,
     }
 
 
-def download_media_sync(url: str, mode: str, temp_dir: Path) -> tuple[Path, dict]:
+def download_media_sync(
+    url: str,
+    mode: str,
+    temp_dir: Path,
+    cached_info: dict | None = None,
+) -> tuple[Path, dict]:
     outtmpl = str(temp_dir / "%(title).80s.%(ext)s")
-    opts: dict = {**_base_ydl_opts(), "outtmpl": outtmpl}
+    opts: dict = {
+        **_base_ydl_opts(),
+        "outtmpl": outtmpl,
+        "concurrent_fragment_downloads": 8,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "postprocessor_args": {"ffmpeg": ["-threads", "4"]},
+    }
 
     if mode == "mp3":
         opts["format"] = "bestaudio/best"
@@ -380,8 +407,16 @@ def download_media_sync(url: str, mode: str, temp_dir: Path) -> tuple[Path, dict
             )
         opts["merge_output_format"] = "mp4"
 
+    info: dict = {}
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        if cached_info:
+            try:
+                info = ydl.process_ie_result(copy.deepcopy(cached_info), download=True) or {}
+            except Exception as exc:
+                logger.info("Cached info fallback to fresh extract for %s: %s", url, exc)
+                info = ydl.extract_info(url, download=True) or {}
+        else:
+            info = ydl.extract_info(url, download=True) or {}
 
     files = [
         p for p in temp_dir.iterdir()
@@ -389,7 +424,7 @@ def download_media_sync(url: str, mode: str, temp_dir: Path) -> tuple[Path, dict
     ]
     if not files:
         raise RuntimeError("Файл не был создан после загрузки")
-    return files[0], info or {}
+    return files[0], info
 
 
 async def extract_url_from_event(event, arg_text: str = "") -> str | None:
@@ -478,6 +513,7 @@ async def send_downloaded_file(
         attributes=attrs,
         buttons=build_switch_buttons(token, mode),
         reply_to=reply_to,
+        part_size_kb=512,
         progress_callback=progress_cb,
     )
 
@@ -492,6 +528,8 @@ async def present_url_options(event, url: str) -> None:
         str_sizes = meta.get("sizes") or {}
         url_store[token]["raw_sizes"] = raw_sizes
         url_store[token]["sizes"] = str_sizes
+        url_store[token]["raw_info"] = meta.get("raw_info")
+        url_store[token]["ts"] = time.monotonic()
 
         title = html.escape(meta["title"][:120])
         uploader = html.escape(meta["uploader"][:60])
@@ -541,14 +579,16 @@ async def direct_download(
     str_sizes: dict = {}
     chosen = mode
 
+    cached_info = None
     try:
         meta = await loop.run_in_executor(executor, extract_info_sync, url)
         raw_sizes = meta.get("raw_sizes") or {}
         str_sizes = meta.get("sizes") or {}
+        cached_info = meta.get("raw_info")
     except Exception:
         pass
 
-    token = store_url_entry(url, raw_sizes, str_sizes)
+    token = store_url_entry(url, raw_sizes, str_sizes, cached_info)
     if mode == "auto":
         chosen = "best"
         for c in ("best", "720", "480"):
@@ -562,7 +602,7 @@ async def direct_download(
 
     temp_dir = Path(tempfile.mkdtemp(prefix="maxgrab_t_"))
     try:
-        file_path, info = await loop.run_in_executor(executor, download_media_sync, url, chosen, temp_dir)
+        file_path, info = await loop.run_in_executor(executor, download_media_sync, url, chosen, temp_dir, cached_info)
         size = file_path.stat().st_size
         if size > MAX_TG_SIZE_BYTES:
             await status_msg.edit(
@@ -875,8 +915,9 @@ async def main() -> None:
 
         temp_dir = Path(tempfile.mkdtemp(prefix="maxgrab_t_"))
         loop = asyncio.get_running_loop()
+        cached_info = entry.get("raw_info") if (time.monotonic() - entry.get("ts", 0)) < 600 else None
         try:
-            file_path, info = await loop.run_in_executor(executor, download_media_sync, url, mode, temp_dir)
+            file_path, info = await loop.run_in_executor(executor, download_media_sync, url, mode, temp_dir, cached_info)
             size = file_path.stat().st_size
             if size > MAX_TG_SIZE_BYTES:
                 await status_msg.edit(
