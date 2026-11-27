@@ -56,8 +56,10 @@ MTPROTO_ENABLED = bool(API_ID and API_HASH)
 MAX_TG_SIZE_BYTES = MTPROTO_TG_SIZE_BYTES if MTPROTO_ENABLED else STANDARD_TG_SIZE_BYTES
 MAX_LIMIT_LABEL = "2 ГБ" if MTPROTO_ENABLED else "50 МБ"
 
-DB_PATH = Path(__file__).resolve().parent / "maxgrab.db"
-MTPROTO_SESSION_PATH = str(Path(__file__).resolve().parent / "maxgrab_mtproto")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data" if (BASE_DIR / "data").is_dir() else BASE_DIR
+DB_PATH = DATA_DIR / "maxgrab.db"
+MTPROTO_SESSION_PATH = str(DATA_DIR / "maxgrab_mtproto")
 mtproto_client: TelegramClient | None = None
 COOKIES_PATH: str | None = None
 
