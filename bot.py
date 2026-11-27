@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gc
 import html
 import logging
 import os
@@ -278,7 +279,7 @@ def get_stats_text() -> str:
 
 
 router = Router()
-executor = ThreadPoolExecutor(max_workers=4)
+executor = ThreadPoolExecutor(max_workers=2)
 
 url_store: Dict[str, dict] = {}
 URL_REGEX = re.compile(r"https?://\S+")
@@ -434,7 +435,7 @@ def _base_ydl_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "js_runtimes": {"deno": {"path": None}, "node": {"path": None}},
+        "js_runtimes": {"node": {"path": None}},
         "remote_components": ["ejs:github"],
     }
     if COOKIES_PATH and Path(COOKIES_PATH).is_file():
@@ -767,6 +768,7 @@ async def direct_download_and_send(
         return False
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        gc.collect()
 
 
 # ================= BOT ADDED / REMOVED FROM GROUP =================
@@ -1122,6 +1124,7 @@ async def handle_download(callback: CallbackQuery, bot: Bot) -> None:
         await status_msg.edit_text(f"❌ <b>Ошибка загрузки:</b>\n{humanize_error(exc)}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        gc.collect()
 
 
 async def setup_bot_profile(bot: Bot) -> None:

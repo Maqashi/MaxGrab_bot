@@ -1,9 +1,6 @@
 FROM python:3.11-slim
 
-# Copy official Deno binary (recommended JS runtime for yt-dlp YouTube EJS)
-COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
-
-# Install FFmpeg, Node.js, and certificates
+# Install FFmpeg, lightweight Node.js (JS runtime for yt-dlp), and certificates
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg nodejs ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -19,6 +16,8 @@ COPY bot.py .
 # Create writable data dir
 RUN chmod -R 777 /app
 
+# Cap Node.js heap so 512 MB free instances (Render/Koyeb) never OOM
+ENV NODE_OPTIONS="--max-old-space-size=96"
 ENV PORT=7860
 EXPOSE 7860
 
