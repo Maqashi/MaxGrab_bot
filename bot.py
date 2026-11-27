@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import html
 import logging
 import os
@@ -58,6 +59,70 @@ MAX_LIMIT_LABEL = "2 ГБ" if MTPROTO_ENABLED else "50 МБ"
 DB_PATH = Path(__file__).resolve().parent / "maxgrab.db"
 MTPROTO_SESSION_PATH = str(Path(__file__).resolve().parent / "maxgrab_mtproto")
 mtproto_client: TelegramClient | None = None
+COOKIES_PATH: str | None = None
+
+
+def init_cookies_file() -> str | None:
+    """Resolve cookies.txt and copy it to a writable /tmp file (Render /etc/secrets is read-only)."""
+    writable_dst = Path(tempfile.gettempdir()) / "maxgrab_cookies.txt"
+
+    candidates = [
+        os.getenv("COOKIES_FILE", "").strip(),
+        "/etc/secrets/cookies.txt",
+        str(Path(__file__).resolve().parent / "cookies.txt"),
+    ]
+    raw_text: str | None = None
+    source_label = ""
+
+    for path_str in candidates:
+        if path_str and Path(path_str).is_file() and Path(path_str).stat().st_size > 0:
+            raw_text = Path(path_str).read_text(encoding="utf-8", errors="ignore")
+            source_label = path_str
+            break
+
+    if raw_text is None:
+        cookies_b64 = os.getenv("COOKIES_B64", "").strip()
+        if cookies_b64:
+            try:
+                raw_text = base64.b64decode(cookies_b64).decode("utf-8", errors="ignore")
+                source_label = "COOKIES_B64"
+            except Exception as exc:
+                logger.warning("[COOKIES] Не удалось декодировать COOKIES_B64: %s", exc)
+
+    if not raw_text:
+        logger.warning("[COOKIES] Файл cookies.txt НЕ найден (проверены /etc/secrets/cookies.txt, COOKIES_FILE, COOKIES_B64).")
+        return None
+
+    yt_lines = sum(1 for line in raw_text.splitlines() if "youtube.com" in line and not line.startswith("#"))
+    if raw_text.lstrip().startswith("[") or raw_text.lstrip().startswith("{"):
+        logger.error("[COOKIES] ОШИБКА ФОРМАТА (%s): похоже на JSON, а yt-dlp нужен формат Netscape!", source_label)
+        return None
+
+    writable_dst.write_text(raw_text, encoding="utf-8")
+    logger.info("[COOKIES] Загружено из %s -> %s (строк youtube.com: %d)", source_label, writable_dst, yt_lines)
+    return str(writable_dst)
+
+
+def humanize_error(exc: Exception) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    if "sign in to confirm" in low or "not a bot" in low:
+        return (
+            "YouTube запросил авторизацию для этого видео. "
+            "Админу нужно обновить файл <code>cookies.txt</code> на сервере."
+        )
+    if "[instagram:user]" in low:
+        return (
+            "Похоже, это ссылка на <b>профиль Instagram</b>, а не на видео.\n"
+            "Отправь ссылку именно на конкретный <b>Reels</b> или <b>видео-пост</b>."
+        )
+    if "private video" in low or "login required" in low or "members-only" in low:
+        return "Это видео приватное или доступно только после входа в аккаунт."
+    if "video unavailable" in low or "not available" in low:
+        return "Видео недоступно, удалено или ограничено по региону."
+    if "unsupported url" in low:
+        return "Эта ссылка не поддерживается — проверь, что ссылка ведёт прямо на видео или трек."
+    return f"<code>{html.escape(msg[:280])}</code>"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("MaxGrabBot")
@@ -360,11 +425,20 @@ def build_format_keyboard(
     )
 
 
-def extract_info_sync(url: str) -> dict:
-    ydl_opts = {
+def _base_ydl_opts() -> dict:
+    opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+    }
+    if COOKIES_PATH and Path(COOKIES_PATH).is_file():
+        opts["cookiefile"] = COOKIES_PATH
+    return opts
+
+
+def extract_info_sync(url: str) -> dict:
+    ydl_opts = {
+        **_base_ydl_opts(),
         "skip_download": True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -383,10 +457,8 @@ def extract_info_sync(url: str) -> dict:
 def download_media_sync(url: str, mode: str, temp_dir: Path) -> tuple[Path, dict]:
     outtmpl = str(temp_dir / "%(title).80s.%(ext)s")
     ydl_opts: dict = {
+        **_base_ydl_opts(),
         "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
         "windowsfilenames": True,
     }
 
@@ -587,7 +659,12 @@ async def present_url_options(message: Message, url: str) -> None:
             "Выбери формат для скачивания:",
             reply_markup=build_format_keyboard(token, str_sizes, raw_sizes),
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("extract_info failed for %s: %s", url, exc)
+        low = str(exc).lower()
+        if "[instagram:user]" in low or "sign in to confirm" in low or "not a bot" in low:
+            await wait_msg.edit_text(f"❌ <b>Не удалось загрузить:</b>\n{humanize_error(exc)}")
+            return
         await wait_msg.edit_text(
             "🔗 Ссылка принята. Выбери формат для скачивания:",
             reply_markup=build_format_keyboard(token),
@@ -680,8 +757,7 @@ async def direct_download_and_send(
         return True
     except Exception as exc:
         logger.exception("Direct download failed for %s", url)
-        err = html.escape(str(exc)[:300])
-        await status_msg.edit_text(f"❌ <b>Ошибка загрузки:</b>\n<code>{err}</code>")
+        await status_msg.edit_text(f"❌ <b>Ошибка загрузки:</b>\n{humanize_error(exc)}")
         return False
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1037,8 +1113,7 @@ async def handle_download(callback: CallbackQuery, bot: Bot) -> None:
         await status_msg.delete()
     except Exception as exc:
         logger.exception("Download failed for %s", url)
-        err = html.escape(str(exc)[:300])
-        await status_msg.edit_text(f"❌ <b>Ошибка загрузки:</b>\n<code>{err}</code>")
+        await status_msg.edit_text(f"❌ <b>Ошибка загрузки:</b>\n{humanize_error(exc)}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1110,10 +1185,12 @@ async def start_health_server() -> web.AppRunner | None:
 
 
 async def main() -> None:
+    global COOKIES_PATH
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise SystemExit("Укажи BOT_TOKEN в .env или в переменных окружения (Secrets / Env Vars)")
 
     init_db()
+    COOKIES_PATH = init_cookies_file()
     health_runner = await start_health_server()
     await init_mtproto_uploader()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
