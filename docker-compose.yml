@@ -1,0 +1,13 @@
+services:
+  maxgrab-bot:
+    build: .
+    container_name: maxgrab-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PORT=
+      - COOKIES_FILE=/app/cookies.txt
+    volumes:
+      - ./data:/app/data
+      - ./cookies.txt:/app/cookies.txt:ro
