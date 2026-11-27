@@ -431,11 +431,12 @@ def build_format_keyboard(
 
 
 def _base_ydl_opts() -> dict:
+    node_path = shutil.which("node") or ("/usr/local/bin/node" if Path("/usr/local/bin/node").is_file() else None)
     opts: dict = {
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "noplaylist": True,
-        "js_runtimes": {"node": {"path": None}},
+        "js_runtimes": {"node": {"path": node_path}},
         "remote_components": ["ejs:github"],
     }
     if COOKIES_PATH and Path(COOKIES_PATH).is_file():

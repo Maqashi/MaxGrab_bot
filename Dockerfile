@@ -1,9 +1,13 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
-# Install FFmpeg, lightweight Node.js (JS runtime for yt-dlp), and certificates
+# Copy official Node.js 22 LTS binary (matching bookworm glibc, required >=20 by yt-dlp EJS)
+COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+
+# Install FFmpeg and certificates
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg nodejs ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    node --version
 
 WORKDIR /app
 
