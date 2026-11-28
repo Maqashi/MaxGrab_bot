@@ -4,6 +4,7 @@ import ctypes
 import ctypes.util
 import gc
 import html
+import json
 import logging
 import math
 import os
@@ -11,6 +12,7 @@ import random
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 import types
@@ -24,6 +26,7 @@ import yt_dlp
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
 from telethon.crypto import aes as tg_aes
+from telethon.network.connection.tcpobfuscated import ConnectionTcpObfuscated
 from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 from telethon.tl.types import (
@@ -166,51 +169,143 @@ async def fast_upload_file(
     client: TelegramClient,
     file_path: Path,
     progress_cb=None,
-    workers: int = 6,
+    workers: int = 4,
 ):
-    """Upload file in parallel 512 KB chunks (up to 6x faster on large videos)."""
+    """Upload big files over multiple independent MTProto TCP connections (FastTelethon-style)."""
     file_size = file_path.stat().st_size
     part_size = 512 * 1024
     total_parts = math.ceil(file_size / part_size)
     is_big = file_size > 10 * 1024 * 1024
     file_id = random.randrange(-(2**63), 2**63 - 1)
 
-    sem = asyncio.Semaphore(workers)
+    # Create independent MTProto upload senders so Telegram/ISP cannot throttle a single socket
+    senders = []
+    dc_id = client.session.dc_id
+    for _ in range(workers):
+        try:
+            s = await client._create_exported_sender(dc_id)
+            senders.append(s)
+        except Exception as exc:
+            logger.warning("Не удалось создать доп. MTProto-сокет: %s", exc)
+            break
+
+    use_senders = bool(senders)
+    if use_senders:
+        logger.info("⚡ Загрузка файла (%.1f МБ) в %d параллельных MTProto-соединений", file_size / (1024 * 1024), len(senders))
+    else:
+        logger.info("Загрузка файла через основное соединение Telethon")
+
+    queue: asyncio.Queue[int | None] = asyncio.Queue()
+    for i in range(total_parts):
+        queue.put_nowait(i)
+    num_w = len(senders) if use_senders else workers
+    for _ in range(num_w):
+        queue.put_nowait(None)
+
     sent_bytes = 0
     file_lock = asyncio.Lock()
 
-    with open(file_path, "rb") as fh:
-        async def upload_part(part_idx: int) -> None:
-            nonlocal sent_bytes
-            async with sem:
-                async with file_lock:
-                    fh.seek(part_idx * part_size)
-                    chunk = fh.read(part_size)
-                if not chunk:
-                    return
-                req = (
-                    SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk)
-                    if is_big
-                    else SaveFilePartRequest(file_id, part_idx, chunk)
-                )
-                for attempt in range(4):
-                    try:
-                        await client(req)
+    try:
+        with open(file_path, "rb") as fh:
+            async def worker(w_idx: int) -> None:
+                nonlocal sent_bytes
+                sender = senders[w_idx] if use_senders else None
+                while True:
+                    part_idx = await queue.get()
+                    if part_idx is None:
                         break
-                    except Exception:
-                        if attempt == 3:
-                            raise
-                        await asyncio.sleep(1.0 * (attempt + 1))
-                sent_bytes += len(chunk)
-                if progress_cb:
-                    await progress_cb(min(sent_bytes, file_size), file_size)
+                    async with file_lock:
+                        fh.seek(part_idx * part_size)
+                        chunk = fh.read(part_size)
+                    if not chunk:
+                        continue
+                    req = (
+                        SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk)
+                        if is_big
+                        else SaveFilePartRequest(file_id, part_idx, chunk)
+                    )
+                    for attempt in range(4):
+                        try:
+                            if sender is not None:
+                                await sender.send(req)
+                            else:
+                                await client(req)
+                            break
+                        except Exception:
+                            if attempt == 3:
+                                raise
+                            await asyncio.sleep(1.0 * (attempt + 1))
+                    sent_bytes += len(chunk)
+                    if progress_cb:
+                        await progress_cb(min(sent_bytes, file_size), file_size)
 
-        tasks = [asyncio.create_task(upload_part(i)) for i in range(total_parts)]
-        await asyncio.gather(*tasks)
+            await asyncio.gather(*(worker(i) for i in range(num_w)))
+    finally:
+        for s in senders:
+            try:
+                await s.disconnect()
+            except Exception:
+                pass
 
     if is_big:
         return InputFileBig(id=file_id, parts=total_parts, name=file_path.name)
     return InputFile(id=file_id, parts=total_parts, name=file_path.name, md5_checksum="")
+
+
+def send_via_bot_api_https_sync(
+    target_chat_id: int,
+    file_path: Path,
+    info: dict,
+    mode: str,
+    token: str,
+    caption: str,
+    reply_to: int | None = None,
+) -> bool:
+    """Fast native C libcurl HTTPS upload to api.telegram.org for files <= 49 MB."""
+    if not shutil.which("curl"):
+        return False
+
+    method = "sendAudio" if mode == "mp3" else "sendVideo"
+    field = "audio" if mode == "mp3" else "video"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+
+    if mode == "mp3":
+        kb = {"inline_keyboard": [[{"text": "🎬 Заменить на видео", "callback_data": f"sw:{token}:best"}]]}
+    else:
+        kb = {"inline_keyboard": [[{"text": "🎵 Заменить на музыку (MP3)", "callback_data": f"sw:{token}:mp3"}]]}
+
+    cmd = [
+        "curl", "-4", "-sS", "--max-time", "180",
+        "-F", f"chat_id={target_chat_id}",
+        "-F", f"caption={caption}",
+        "-F", "parse_mode=HTML",
+        "-F", f"reply_markup={json.dumps(kb, ensure_ascii=False)}",
+        "-F", f"{field}=@{file_path}",
+    ]
+    if mode == "mp3":
+        title_raw = (info.get("title") or file_path.stem)[:64]
+        uploader_raw = (info.get("uploader") or "")[:64]
+        cmd += ["-F", f"title={title_raw}"]
+        if uploader_raw:
+            cmd += ["-F", f"performer={uploader_raw}"]
+    else:
+        cmd += ["-F", "supports_streaming=true"]
+    if reply_to:
+        cmd += ["-F", f"reply_to_message_id={reply_to}"]
+    cmd.append(url)
+
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        logger.warning("curl HTTPS upload failed (rc=%d): %s", res.returncode, res.stderr[:200])
+        return False
+    try:
+        data = json.loads(res.stdout)
+        if data.get("ok"):
+            return True
+        logger.warning("Bot API HTTPS error: %s", res.stdout[:200])
+        return False
+    except Exception:
+        return False
 
 
 # ================= DATABASE =================
@@ -618,6 +713,25 @@ async def send_downloaded_file(
         + f"\n\n⚡ @{BOT_USERNAME}"
     )[:1024]
 
+    # Fast path for files <= 49 MB: native C curl HTTPS upload to api.telegram.org
+    if size <= 49 * 1024 * 1024:
+        await status_msg.edit(f"📤 <b>Отправляю файл ({size_mb:.1f} МБ)...</b>", parse_mode="html")
+        loop = asyncio.get_running_loop()
+        sent_ok = await loop.run_in_executor(
+            executor,
+            send_via_bot_api_https_sync,
+            int(target_chat),
+            file_path,
+            info,
+            mode,
+            token,
+            caption,
+            reply_to,
+        )
+        if sent_ok:
+            return
+
+    start_ts = time.monotonic()
     last_edit = [0.0]
 
     async def progress_cb(sent: int, total: int) -> None:
@@ -628,9 +742,11 @@ async def send_downloaded_file(
             return
         last_edit[0] = now
         pct = min(99, int(sent * 100 / max(total, 1)))
+        elapsed = max(0.5, now - start_ts)
+        speed_mb = (sent / (1024 * 1024)) / elapsed
         try:
             await status_msg.edit(
-                f"📤 <b>Отправляю файл...</b> {pct}% ({sent / (1024*1024):.1f} / {total / (1024*1024):.1f} МБ)",
+                f"📤 <b>Отправляю файл...</b> {pct}% ({sent / (1024*1024):.1f} / {total / (1024*1024):.1f} МБ · {speed_mb:.1f} МБ/с)",
                 parse_mode="html",
             )
         except Exception:
@@ -647,7 +763,7 @@ async def send_downloaded_file(
         attrs = [DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)]
 
     if size > 10 * 1024 * 1024:
-        upload_target = await fast_upload_file(client, file_path, progress_cb=progress_cb, workers=6)
+        upload_target = await fast_upload_file(client, file_path, progress_cb=progress_cb, workers=4)
     else:
         upload_target = str(file_path)
 
@@ -780,7 +896,7 @@ async def main() -> None:
 
     enable_native_aes_acceleration()
     init_db()
-    client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+    client = TelegramClient(SESSION_PATH, API_ID, API_HASH, connection=ConnectionTcpObfuscated)
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     BOT_ID = me.id
