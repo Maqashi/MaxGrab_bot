@@ -1,14 +1,19 @@
 import asyncio
 import copy
+import ctypes
+import ctypes.util
 import gc
 import html
 import logging
+import math
 import os
+import random
 import re
 import shutil
 import sqlite3
 import tempfile
 import time
+import types
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -18,13 +23,17 @@ from typing import Dict
 import yt_dlp
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
+from telethon.crypto import aes as tg_aes
 from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 from telethon.tl.types import (
     BotCommand,
     BotCommandScopeChats,
     BotCommandScopeDefault,
     DocumentAttributeAudio,
     DocumentAttributeVideo,
+    InputFile,
+    InputFileBig,
 )
 
 load_dotenv()
@@ -69,6 +78,139 @@ GROUP_MEDIA_DOMAINS = (
 URL_REGEX = re.compile(r"https?://\S+")
 executor = ThreadPoolExecutor(max_workers=4)
 url_store: Dict[str, dict] = {}
+
+
+# ================= NATIVE C AES-IGE ACCELERATOR (ZERO-COMPILE CRYPTG) =================
+def enable_native_aes_acceleration() -> None:
+    """Attach Termux/Linux system OpenSSL libcrypto AES_ige_encrypt directly to Telethon."""
+    if tg_aes.cryptg is not None:
+        logger.info("⚡ cryptg уже установлен и активен!")
+        return
+
+    lib_candidates = [
+        "/data/data/com.termux/files/usr/lib/libcrypto.so",
+        "/data/data/com.termux/files/usr/lib/libcrypto.so.3",
+        ctypes.util.find_library("crypto") or "",
+        "libcrypto.so.3",
+        "libcrypto.so",
+    ]
+    lib = None
+    for path in lib_candidates:
+        if not path:
+            continue
+        try:
+            cand = ctypes.CDLL(path)
+            if hasattr(cand, "AES_set_encrypt_key") and hasattr(cand, "AES_ige_encrypt"):
+                lib = cand
+                break
+        except OSError:
+            continue
+
+    if lib is None:
+        logger.warning("libcrypto.so не найден — используется стандартный pyaes.")
+        return
+
+    lib.AES_set_encrypt_key.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+    lib.AES_set_encrypt_key.restype = ctypes.c_int
+    lib.AES_set_decrypt_key.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+    lib.AES_set_decrypt_key.restype = ctypes.c_int
+    lib.AES_ige_encrypt.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    ]
+    lib.AES_ige_encrypt.restype = None
+
+    def _encrypt_ige(plain: bytes, key: bytes, iv: bytes) -> bytes:
+        n = len(plain)
+        key_buf = ctypes.create_string_buffer(512)
+        if lib.AES_set_encrypt_key(key, len(key) * 8, key_buf) != 0:
+            raise RuntimeError("AES_set_encrypt_key failed")
+        out_buf = ctypes.create_string_buffer(n)
+        iv_buf = ctypes.create_string_buffer(iv, 33)
+        lib.AES_ige_encrypt(plain, out_buf, n, key_buf, iv_buf, 1)
+        return out_buf.raw
+
+    def _decrypt_ige(cipher: bytes, key: bytes, iv: bytes) -> bytes:
+        n = len(cipher)
+        key_buf = ctypes.create_string_buffer(512)
+        if lib.AES_set_decrypt_key(key, len(key) * 8, key_buf) != 0:
+            raise RuntimeError("AES_set_decrypt_key failed")
+        out_buf = ctypes.create_string_buffer(n)
+        iv_buf = ctypes.create_string_buffer(iv, 33)
+        lib.AES_ige_encrypt(cipher, out_buf, n, key_buf, iv_buf, 0)
+        return out_buf.raw
+
+    # Byte-for-byte self-test against Telethon's built-in pyaes before activating
+    try:
+        test_p = b"MaxGrabSpeedTest" * 4
+        test_k = bytes(range(32))
+        test_iv = bytes(range(32, 64))
+        ref_c = tg_aes.AES.encrypt_ige(test_p, test_k, test_iv)
+        fast_c = _encrypt_ige(test_p, test_k, test_iv)
+        fast_p = _decrypt_ige(fast_c, test_k, test_iv)
+        assert fast_c == ref_c and fast_p == test_p
+    except Exception as exc:
+        logger.warning("Самопроверка libcrypto AES-IGE не пройдена (%s) — остаёмся на pyaes.", exc)
+        return
+
+    shim = types.SimpleNamespace(encrypt_ige=_encrypt_ige, decrypt_ige=_decrypt_ige)
+    tg_aes.cryptg = shim
+    logger.info("⚡ Аппаратное C-ускорение AES-IGE (libcrypto OpenSSL) успешно активировано!")
+
+
+async def fast_upload_file(
+    client: TelegramClient,
+    file_path: Path,
+    progress_cb=None,
+    workers: int = 6,
+):
+    """Upload file in parallel 512 KB chunks (up to 6x faster on large videos)."""
+    file_size = file_path.stat().st_size
+    part_size = 512 * 1024
+    total_parts = math.ceil(file_size / part_size)
+    is_big = file_size > 10 * 1024 * 1024
+    file_id = random.randrange(-(2**63), 2**63 - 1)
+
+    sem = asyncio.Semaphore(workers)
+    sent_bytes = 0
+    file_lock = asyncio.Lock()
+
+    with open(file_path, "rb") as fh:
+        async def upload_part(part_idx: int) -> None:
+            nonlocal sent_bytes
+            async with sem:
+                async with file_lock:
+                    fh.seek(part_idx * part_size)
+                    chunk = fh.read(part_size)
+                if not chunk:
+                    return
+                req = (
+                    SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk)
+                    if is_big
+                    else SaveFilePartRequest(file_id, part_idx, chunk)
+                )
+                for attempt in range(4):
+                    try:
+                        await client(req)
+                        break
+                    except Exception:
+                        if attempt == 3:
+                            raise
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                sent_bytes += len(chunk)
+                if progress_cb:
+                    await progress_cb(min(sent_bytes, file_size), file_size)
+
+        tasks = [asyncio.create_task(upload_part(i)) for i in range(total_parts)]
+        await asyncio.gather(*tasks)
+
+    if is_big:
+        return InputFileBig(id=file_id, parts=total_parts, name=file_path.name)
+    return InputFile(id=file_id, parts=total_parts, name=file_path.name, md5_checksum="")
 
 
 # ================= DATABASE =================
@@ -504,9 +646,14 @@ async def send_downloaded_file(
     else:
         attrs = [DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)]
 
+    if size > 10 * 1024 * 1024:
+        upload_target = await fast_upload_file(client, file_path, progress_cb=progress_cb, workers=6)
+    else:
+        upload_target = str(file_path)
+
     await client.send_file(
         target_chat,
-        file=str(file_path),
+        file=upload_target,
         caption=caption,
         parse_mode="html",
         supports_streaming=(mode != "mp3"),
@@ -514,7 +661,7 @@ async def send_downloaded_file(
         buttons=build_switch_buttons(token, mode),
         reply_to=reply_to,
         part_size_kb=512,
-        progress_callback=progress_cb,
+        progress_callback=progress_cb if isinstance(upload_target, str) else None,
     )
 
 
@@ -631,6 +778,7 @@ async def main() -> None:
     if not BOT_TOKEN or not API_ID or not API_HASH:
         raise SystemExit("Укажи BOT_TOKEN, API_ID и API_HASH в файле .env")
 
+    enable_native_aes_acceleration()
     init_db()
     client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
     await client.start(bot_token=BOT_TOKEN)
