@@ -26,8 +26,11 @@ import yt_dlp
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
 from telethon.crypto import aes as tg_aes
-from telethon.network.connection.tcpobfuscated import ConnectionTcpObfuscated
+from telethon.network import MTProtoSender
+from telethon.tl.alltlobjects import LAYER
+from telethon.tl.functions import InvokeWithLayerRequest, InvokeWithoutUpdatesRequest
 from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.functions.help import GetConfigRequest
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 from telethon.tl.types import (
     BotCommand,
@@ -177,17 +180,47 @@ async def fast_upload_file(
     total_parts = math.ceil(file_size / part_size)
     is_big = file_size > 10 * 1024 * 1024
     file_id = random.randrange(-(2**63), 2**63 - 1)
+    t0 = time.monotonic()
 
-    # Create independent MTProto upload senders so Telegram/ISP cannot throttle a single socket
-    senders = []
-    dc_id = client.session.dc_id
-    for _ in range(workers):
+    # Open independent MTProto upload sockets on the same DC reusing auth_key (real FastTelethon)
+    async def _open_sender(dc) -> MTProtoSender | None:
+        s = MTProtoSender(client.session.auth_key, loggers=client._log, auto_reconnect=False)
         try:
-            s = await client._create_exported_sender(dc_id)
-            senders.append(s)
+            await asyncio.wait_for(
+                s.connect(
+                    client._connection(
+                        dc.ip_address,
+                        dc.port,
+                        dc.id,
+                        loggers=client._log,
+                        proxy=client._proxy,
+                        local_addr=client._local_addr,
+                    )
+                ),
+                timeout=10,
+            )
+            init_req = copy.copy(client._init_request)
+            init_req.query = GetConfigRequest()
+            await asyncio.wait_for(
+                s.send(InvokeWithLayerRequest(LAYER, InvokeWithoutUpdatesRequest(init_req))),
+                timeout=10,
+            )
+            return s
         except Exception as exc:
-            logger.warning("Не удалось создать доп. MTProto-сокет: %s", exc)
-            break
+            logger.warning("Не удалось инициализировать доп. MTProto-сокет: %s", exc)
+            try:
+                await s.disconnect()
+            except Exception:
+                pass
+            return None
+
+    senders: list[MTProtoSender] = []
+    try:
+        dc = await client._get_dc(client.session.dc_id)
+        opened = await asyncio.gather(*(_open_sender(dc) for _ in range(workers)))
+        senders = [s for s in opened if s is not None]
+    except Exception as exc:
+        logger.warning("Не удалось создать доп. MTProto-сокеты: %s", exc)
 
     use_senders = bool(senders)
     if use_senders:
@@ -226,12 +259,14 @@ async def fast_upload_file(
                     )
                     for attempt in range(4):
                         try:
-                            if sender is not None:
-                                await sender.send(req)
+                            if sender is not None and attempt < 2:
+                                await asyncio.wait_for(sender.send(req), timeout=45)
                             else:
-                                await client(req)
+                                await asyncio.wait_for(client(req), timeout=45)
                             break
-                        except Exception:
+                        except Exception as exc:
+                            if attempt == 1 and sender is not None:
+                                logger.warning("Доп. MTProto-сокет #%d сбойнул (%s), переключаюсь на основной", w_idx, exc)
                             if attempt == 3:
                                 raise
                             await asyncio.sleep(1.0 * (attempt + 1))
@@ -241,11 +276,16 @@ async def fast_upload_file(
 
             await asyncio.gather(*(worker(i) for i in range(num_w)))
     finally:
-        for s in senders:
-            try:
-                await s.disconnect()
-            except Exception:
-                pass
+        if senders:
+            await asyncio.gather(*(s.disconnect() for s in senders), return_exceptions=True)
+
+    elapsed = max(0.1, time.monotonic() - t0)
+    logger.info(
+        "✅ MTProto-загрузка завершена: %.1f МБ за %.1f сек (%.2f МБ/с)",
+        file_size / (1024 * 1024),
+        elapsed,
+        (file_size / (1024 * 1024)) / elapsed,
+    )
 
     if is_big:
         return InputFileBig(id=file_id, parts=total_parts, name=file_path.name)
@@ -274,33 +314,66 @@ def send_via_bot_api_https_sync(
     else:
         kb = {"inline_keyboard": [[{"text": "🎵 Заменить на музыку (MP3)", "callback_data": f"sw:{token}:mp3"}]]}
 
+    # Avoid commas/semicolons/quotes in yt-dlp filenames breaking curl -F syntax
+    safe_upload_path = file_path
+    temp_link: Path | None = None
+    try:
+        cand = file_path.parent / f"upload_{token}{file_path.suffix}"
+        if cand != file_path:
+            os.symlink(file_path, cand)
+            safe_upload_path = cand
+            temp_link = cand
+    except OSError:
+        safe_upload_path = file_path
+
+    duration = int(info.get("duration") or 0)
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    nice_name = f"maxgrab_{token}{file_path.suffix}"
+
     cmd = [
         "curl", "-4", "-sS", "--max-time", "180",
-        "-F", f"chat_id={target_chat_id}",
-        "-F", f"caption={caption}",
-        "-F", "parse_mode=HTML",
-        "-F", f"reply_markup={json.dumps(kb, ensure_ascii=False)}",
-        "-F", f"{field}=@{file_path}",
+        "--form-string", f"chat_id={target_chat_id}",
+        "--form-string", f"caption={caption}",
+        "--form-string", "parse_mode=HTML",
+        "--form-string", f"reply_markup={json.dumps(kb, ensure_ascii=False)}",
+        "-F", f"{field}=@{safe_upload_path};filename={nice_name}",
     ]
+    if duration > 0:
+        cmd += ["--form-string", f"duration={duration}"]
     if mode == "mp3":
         title_raw = (info.get("title") or file_path.stem)[:64]
         uploader_raw = (info.get("uploader") or "")[:64]
-        cmd += ["-F", f"title={title_raw}"]
+        cmd += ["--form-string", f"title={title_raw}"]
         if uploader_raw:
-            cmd += ["-F", f"performer={uploader_raw}"]
+            cmd += ["--form-string", f"performer={uploader_raw}"]
     else:
-        cmd += ["-F", "supports_streaming=true"]
+        cmd += ["--form-string", "supports_streaming=true"]
+        if width > 0 and height > 0:
+            cmd += ["--form-string", f"width={width}", "--form-string", f"height={height}"]
     if reply_to:
-        cmd += ["-F", f"reply_to_message_id={reply_to}"]
+        cmd += ["--form-string", f"reply_to_message_id={reply_to}"]
     cmd.append(url)
 
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    t0 = time.monotonic()
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        if temp_link and temp_link.is_symlink():
+            try:
+                temp_link.unlink()
+            except OSError:
+                pass
+
     if res.returncode != 0:
         logger.warning("curl HTTPS upload failed (rc=%d): %s", res.returncode, res.stderr[:200])
         return False
     try:
         data = json.loads(res.stdout)
         if data.get("ok"):
+            elapsed = max(0.1, time.monotonic() - t0)
+            mb = file_path.stat().st_size / (1024 * 1024)
+            logger.info("⚡ curl HTTPS-отправка завершена: %.1f МБ за %.1f сек (%.2f МБ/с)", mb, elapsed, mb / elapsed)
             return True
         logger.warning("Bot API HTTPS error: %s", res.stdout[:200])
         return False
@@ -896,7 +969,7 @@ async def main() -> None:
 
     enable_native_aes_acceleration()
     init_db()
-    client = TelegramClient(SESSION_PATH, API_ID, API_HASH, connection=ConnectionTcpObfuscated)
+    client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     BOT_ID = me.id
